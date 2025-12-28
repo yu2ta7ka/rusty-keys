@@ -2,41 +2,44 @@
 #![no_std]
 
 use defmt_rtt as _;
-use embedded_hal::digital::v2::{InputPin, OutputPin};
 use panic_probe as _;
+use rp_pico as bsp;
 
 use bsp::hal;
 use hal::pac;
-use rp_pico as bsp;
+use usb_device::prelude::*;
 
-use usb_device as usbd;
-use usbd::prelude::UsbDeviceBuilder;
+use usbd_hid::descriptor::KeyboardReport;
 use usbd_hid::descriptor::SerializedDescriptor;
 
-#[defmt::panic_handler]
-fn panic() -> ! {
-    cortex_m::asm::udf()
-}
+// USBのアロケータをstaticに配置して、プログラム実行中にメモリから消えないようにします。
+use core::option::Option;
+static mut USB_BUS: Option<usb_device::bus::UsbBusAllocator<hal::usb::UsbBus>> = None;
 
-pub fn exit() -> ! {
-    loop {
-        cortex_m::asm::bkpt();
-    }
-}
-
-fn sleep() {
-    for _ in 0..10000 {
+const USB_REPORT_DELAY: u32 = 10_000;
+fn usb_sleep(
+    count: u32,
+    usb_dev: &mut usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
+    hid: &mut usbd_hid::hid_class::HIDClass<'static, hal::usb::UsbBus>,
+) {
+    for _ in 0..count {
+        // UsbBus をポーリングし、HIDクラスにディスパッチします。 
+        // USB に準拠するには、USB ホストに接続している間、 
+        // 少なくとも 10 ミリ秒ごとに 1 回呼び出す必要があるため、このようにループで実行します。 
+        usb_dev.poll(&mut [hid]);
         cortex_m::asm::nop();
     }
 }
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
-    defmt::println!("Hello, world! yu2ta7ka");
-
+    // ペリフェラルの取得、これをHALやusb_deviceクレートに渡すことで制御を実現します。 
     let mut p = pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(p.WATCHDOG);
+
+    // クロックとpllsを初期化します。 
     let clocks = hal::clocks::init_clocks_and_plls(
+        // マイコンはクリスタルの周波数を知らないため、BSPからの情報を渡します。 
         bsp::XOSC_CRYSTAL_FREQ,
         p.XOSC,
         p.CLOCKS,
@@ -48,61 +51,68 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let bus = hal::usb::UsbBus::new(
+    // USBの通信チャネルを提供してくれるBus allocatorを準備します。 
+    let usb_bus = hal::usb::UsbBus::new(
         p.USBCTRL_REGS,
         p.USBCTRL_DPRAM,
         clocks.usb_clock,
         true,
         &mut p.RESETS,
     );
-    let usb_bus_allocator = usbd::class_prelude::UsbBusAllocator::new(bus);
 
-    let vid_pid = usbd::device::UsbVidPid(0x6666, 0x0487);
-    let mut hid = usbd_hid::hid_class::HIDClass::new(
-        &usb_bus_allocator,
-        usbd_hid::descriptor::KeyboardReport::desc(),
-        60,
-    );
-    let mut dev = UsbDeviceBuilder::new(&usb_bus_allocator, vid_pid)
+    // アロケータをstaticな領域に固定します。
+    unsafe {
+        USB_BUS = Some(usb_device::bus::UsbBusAllocator::new(usb_bus));
+    }
+    let bus_allocator = unsafe { USB_BUS.as_ref().unwrap() };
+
+    // ベンダーIDとプロダクトIDを設定します。今回は任意の値にします。 
+    let vid_pid = usb_device::device::UsbVidPid(0x6666, 0x0487);
+
+    // HIDクラスを準備します。
+    let mut hid = usbd_hid::hid_class::HIDClass::new(bus_allocator, KeyboardReport::desc(), 60);
+
+    // USBデバイスを作成します。
+    let mut usb_dev = UsbDeviceBuilder::new(bus_allocator, vid_pid)
         .manufacturer("yu2ta7ka")
         .product("RustyKeysImitation")
         .serial_number("487")
         .build();
 
-    let sio = hal::Sio::new(p.SIO);
-    let pins = bsp::Pins::new(p.IO_BANK0, p.PADS_BANK0, sio.gpio_bank0, &mut p.RESETS);
-    let mut col1 = pins.gpio16.into_push_pull_output();
-    let row1 = pins.gpio22.into_pull_down_input();
-    let row2 = pins.gpio21.into_pull_down_input();
+    defmt::println!("USB Device Initialized.");
+
+    // 'a'キーを押すレポートと離すレポートを準備します。
+    let press_report = usbd_hid::descriptor::KeyboardReport {
+        modifier: 0,
+        reserved: 0,
+        leds: 0,
+        keycodes: [0x04, 0, 0, 0, 0, 0], // 'a'
+    };
+    let release_report = usbd_hid::descriptor::KeyboardReport {
+        modifier: 0,
+        reserved: 0,
+        leds: 0,
+        keycodes: [0, 0, 0, 0, 0, 0],
+    };
 
     loop {
-        let mut keys: [u8; 6] = [0u8; 6];
-        let mut num_keys: usize = 0;
-        dev.poll(&mut [&mut hid]);
+        // 1. キー検知回数を減らすために待ちを入れます。
+        usb_sleep(USB_REPORT_DELAY, &mut usb_dev, &mut hid);
 
-        col1.set_high().ok().unwrap();
-        sleep();
-        if row1.is_high().ok().unwrap() {
-            keys[num_keys] = 0x1f;
-            num_keys += 1;
-            defmt::println!("key 22");
-        }
-        if row2.is_high().ok().unwrap() {
-            keys[num_keys] = 0x1c;
-            num_keys += 1;
-            defmt::println!("key 21");
-        }
-        sleep();
-        col1.set_low().ok().unwrap();
+        // 2. キー押下情報を渡します。
+        let _ = hid.push_input(&press_report);
 
-        let report = usbd_hid::descriptor::KeyboardReport {
-            modifier: 0,
-            reserved: 0,
-            leds: 0,
-            keycodes: keys,
-        };
-        hid.push_input(&report).ok();
+        // 3. キー検知回数を減らすために待ちを入れます。
+        usb_sleep(USB_REPORT_DELAY, &mut usb_dev, &mut hid);
+
+        // 4. キー離上情報を渡します。
+        let _ = hid.push_input(&release_report);
+
+        defmt::println!("Sent 'a'");
     }
+}
 
-    exit()
+#[defmt::panic_handler]
+fn panic() -> ! {
+    cortex_m::asm::udf()
 }
